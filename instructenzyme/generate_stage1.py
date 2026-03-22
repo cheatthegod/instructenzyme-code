@@ -94,7 +94,7 @@ def generate_batch(
     start_token_id: int,
     end_token_id: int,
     allowed_ids: torch.Tensor,
-    max_new_tokens: int,
+    per_sample_max_new_tokens: torch.Tensor,
     do_sample: bool,
     temperature: float,
     top_p: float,
@@ -103,6 +103,8 @@ def generate_batch(
     device = structure_embeddings.device
     batch_size = structure_embeddings.shape[0]
     autocast_dtype = torch.bfloat16 if use_bf16 else torch.float16
+    per_sample_max_new_tokens = per_sample_max_new_tokens.to(device=device, dtype=torch.long)
+    max_decode_steps = int(per_sample_max_new_tokens.max().item()) if per_sample_max_new_tokens.numel() > 0 else 0
 
     with torch.autocast(device_type="cuda", dtype=autocast_dtype, enabled=device.type == "cuda"):
         prompt_embeds = model.encode_structure(structure_embeddings, structure_attention_mask)
@@ -124,7 +126,7 @@ def generate_batch(
     finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
     ended_with_stop = [False for _ in range(batch_size)]
 
-    for _ in range(max_new_tokens):
+    for step_idx in range(max_decode_steps):
         filtered_logits = restrict_logits(logits, allowed_ids)
         if do_sample:
             if temperature <= 0:
@@ -145,8 +147,11 @@ def generate_batch(
             if token_id == end_token_id:
                 finished[i] = True
                 ended_with_stop[i] = True
-            else:
-                generated_ids[i].append(token_id)
+                continue
+
+            generated_ids[i].append(token_id)
+            if (step_idx + 1) >= int(per_sample_max_new_tokens[i].item()):
+                finished[i] = True
 
         if bool(finished.all().item()):
             break
@@ -206,7 +211,7 @@ def main() -> None:
 
     dataset = ProteinIndexDataset(args.index_path, tokenizer, max_samples=args.max_samples)
     shard_indices = [i for i in range(len(dataset)) if i % args.num_shards == args.shard_index]
-    shard_indices.sort(key=lambda i: dataset.records[i]["seq_len"])
+    shard_indices.sort(key=lambda i: int(dataset.records[i].get("seq_len", len(dataset.records[i]["sequence"]))))
     shard_batches = chunked(shard_indices, args.batch_size)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -228,7 +233,10 @@ def main() -> None:
             samples = [dataset[idx] for idx in batch_indices]
             native_sequences = [sample["sequence"] for sample in samples]
             native_lengths = [len(seq) for seq in native_sequences]
-            max_new_tokens = args.max_new_tokens if args.max_new_tokens > 0 else max(native_lengths) + 1
+            if args.max_new_tokens > 0:
+                per_sample_max_new_tokens = torch.full((len(samples),), args.max_new_tokens, dtype=torch.long, device=device)
+            else:
+                per_sample_max_new_tokens = torch.tensor([length + 1 for length in native_lengths], dtype=torch.long, device=device)
             structure_embeddings, structure_attention_mask = collate_structure_batch(samples, device)
 
             generated_sequences, ended_with_stop = generate_batch(
@@ -239,7 +247,7 @@ def main() -> None:
                 start_token_id=start_token_id,
                 end_token_id=end_token_id,
                 allowed_ids=allowed_ids,
-                max_new_tokens=max_new_tokens,
+                per_sample_max_new_tokens=per_sample_max_new_tokens,
                 do_sample=args.do_sample,
                 temperature=args.temperature,
                 top_p=args.top_p,

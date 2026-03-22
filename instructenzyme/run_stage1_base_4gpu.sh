@@ -21,8 +21,14 @@ LR=${LR:-2e-4}
 EVAL_EVERY=${EVAL_EVERY:-100}
 SAVE_EVERY=${SAVE_EVERY:-100}
 MAX_VAL_SAMPLES=${MAX_VAL_SAMPLES:-512}
+PROJECTOR_INIT_CKPT=${PROJECTOR_INIT_CKPT:-}
 
 mkdir -p "${OUTPUT_DIR}"
+
+EXTRA_ARGS=()
+if [[ -n "${PROJECTOR_INIT_CKPT}" ]]; then
+  EXTRA_ARGS+=(--projector_init_ckpt "${PROJECTOR_INIT_CKPT}")
+fi
 
 exec torchrun --standalone --nproc_per_node=4 /home/ubuntu/cqr_files/protein_design/instructenzyme/train_stage1.py \
   --model_name_or_path "${MODEL_PATH}" \
@@ -38,4 +44,5 @@ exec torchrun --standalone --nproc_per_node=4 /home/ubuntu/cqr_files/protein_des
   --save_every "${SAVE_EVERY}" \
   --max_val_samples "${MAX_VAL_SAMPLES}" \
   --max_train_steps "${MAX_TRAIN_STEPS}" \
-  --bf16
+  --bf16 \
+  "${EXTRA_ARGS[@]}"

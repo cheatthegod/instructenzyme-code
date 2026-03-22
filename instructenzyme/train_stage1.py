@@ -32,6 +32,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train_index", type=Path, default=Path("/home/ubuntu/cqr_files/protein_design/instructenzyme/data/index/train.jsonl"))
     parser.add_argument("--val_index", type=Path, default=Path("/home/ubuntu/cqr_files/protein_design/instructenzyme/data/index/val.jsonl"))
     parser.add_argument("--output_dir", type=Path, default=Path("/home/ubuntu/cqr_files/protein_design/instructenzyme/runs/progen2-base-stage1"))
+    parser.add_argument("--projector_init_ckpt", type=Path, default=None)
     parser.add_argument("--structure_hidden_size", type=int, default=128)
     parser.add_argument("--num_queries", type=int, default=256)
     parser.add_argument("--projector_num_heads", type=int, default=8)
@@ -278,6 +279,14 @@ def main() -> None:
         pos_encoding=args.projector_pos_encoding,
         dtype=dtype,
     )
+    if args.projector_init_ckpt is not None:
+        ckpt_path = args.projector_init_ckpt
+        if ckpt_path.is_dir():
+            ckpt_path = ckpt_path / 'projector.pt'
+        init_state = torch.load(ckpt_path, map_location='cpu')
+        projector_state = init_state['projector'] if isinstance(init_state, dict) and 'projector' in init_state else init_state
+        model.projector.load_state_dict(projector_state, strict=True)
+        rank0_print(f"loaded projector init from {ckpt_path}")
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
     model.to(device)

@@ -1,5 +1,7 @@
 # InstructEnzyme Code-Only Export
 
+Chinese version: [README_zh.md](README_zh.md)
+
 ## What This Repository Is
 
 This is a **code-only** export of the current `InstructEnzyme` work.
@@ -65,17 +67,37 @@ Computed on the full held-out test set (`584` samples):
 
 Free-running greedy generation on the held-out test set (`584` samples), using `4 x H100` and `batch_size=8` per GPU:
 
-- `mean_sequence_recovery = 0.06586172052768441`
-- `global_residue_recovery = 0.06456971813419805`
-- `exact_match_rate = 0.0`
-- `stop_rate = 0.05650684931506849`
-- `mean_length_ratio = 1.0409335093377838`
+- original greedy benchmark (`batch_size=8`):
+  - `mean_sequence_recovery = 0.06586172052768441`
+  - `global_residue_recovery = 0.06456971813419805`
+  - `exact_match_rate = 0.0`
+  - `stop_rate = 0.05650684931506849`
+  - `mean_length_ratio = 1.0409335093377838`
+- patched greedy benchmark with per-sample stopping (`batch_size=16`):
+  - `mean_sequence_recovery = 0.06530344306544608`
+  - `global_residue_recovery = 0.0636118732851085`
+  - `exact_match_rate = 0.0`
+  - `stop_rate = 0.08047945205479452`
+  - `mean_length_ratio = 0.9731542024571799`
 
 Interpretation:
 
 - teacher-forcing metrics are already decent
 - free-running generation is still weak
 - this is expected for a Stage-1 alignment-only model where the backbone remains frozen
+
+### Longer Stage-1 continuation
+
+A longer projector-only continuation run was launched from the previous best checkpoint, still without Stage-2 LoRA.
+
+Current best checkpoint from that run (`step 1000` as of 2026-03-22):
+
+- `val_loss = 1.1851611747426283`
+- `val_ppl = 3.2712140160567045`
+- `val_recovery = 0.6351145485439738`
+- `val_top5_recovery = 0.8728833421222242`
+
+This is already better than the original full-validation result from the 1k-step run.
 
 ## Repository Layout
 
