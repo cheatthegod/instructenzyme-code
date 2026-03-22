@@ -24,4 +24,15 @@ cp -f "${EXPORT_ROOT}/third_party_overrides/LLaVA/llava/model/multimodal_project
 cp -f "${EXPORT_ROOT}/third_party_overrides/LLaVA/llava/model/llava_arch.py" "${TARGET_ROOT}/LLaVA/llava/model/llava_arch.py"
 cp -f "${EXPORT_ROOT}/third_party_overrides/LLaVA/llava/train/train.py" "${TARGET_ROOT}/LLaVA/llava/train/train.py"
 
+mkdir -p "${TARGET_ROOT}/LLaVA/llava/model/language_model"
+cp -f "${EXPORT_ROOT}/third_party_overrides/LLaVA/llava/model/language_model/llava_llama.py" "${TARGET_ROOT}/LLaVA/llava/model/language_model/llava_llama.py"
+cp -f "${EXPORT_ROOT}/third_party_overrides/LLaVA/llava/model/language_model/llava_mistral.py" "${TARGET_ROOT}/LLaVA/llava/model/language_model/llava_mistral.py"
+cp -f "${EXPORT_ROOT}/third_party_overrides/LLaVA/llava/model/language_model/llava_mpt.py" "${TARGET_ROOT}/LLaVA/llava/model/language_model/llava_mpt.py"
+rm -rf "${TARGET_ROOT}/LLaVA/llava/model/language_model/progen2_hf"
+rm -rf "${TARGET_ROOT}/LLaVA/llava/model/language_model/progen3"
+cp -r "${EXPORT_ROOT}/third_party_overrides/LLaVA/llava/model/language_model/progen2_hf" "${TARGET_ROOT}/LLaVA/llava/model/language_model/progen2_hf"
+cp -r "${EXPORT_ROOT}/third_party_overrides/LLaVA/llava/model/language_model/progen3" "${TARGET_ROOT}/LLaVA/llava/model/language_model/progen3"
+find "${TARGET_ROOT}/LLaVA/llava/model/language_model" -type d -name '__pycache__' -prune -exec rm -rf {} +
+find "${TARGET_ROOT}/LLaVA/llava/model/language_model" -type f -name '*.pyc' -delete
+
 echo "Applied InstructEnzyme overrides into ${TARGET_ROOT}"

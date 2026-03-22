@@ -10,13 +10,14 @@ It packages the parts of the project that were actually needed to run the comple
 2. extract `LigandMPNN` residue embeddings (`h_V_last_layer`)
 3. build sequence/embedding manifests and optional `WebDataset` shards
 4. train a **Stage-1 adapter-only** structure-to-language alignment model on top of `ProGen2-base`
-5. evaluate teacher-forcing metrics (`loss`, `perplexity`, `recovery`, `top-5 recovery`)
-6. run a 4-GPU batched free-running generation benchmark
+5. vendor the required `LLaVA` language-model-side wrappers plus local `ProGen2/ProGen3` backbone code
+6. evaluate teacher-forcing metrics (`loss`, `perplexity`, `recovery`, `top-5 recovery`)
+7. run a 4-GPU batched free-running generation benchmark
 
 This export intentionally **does not include**:
 
 - model weights
-- Hugging Face checkpoints
+- pretrained parameter checkpoints
 - `LigandMPNN` parameters
 - raw datasets
 - generated `PDB` files
@@ -99,6 +100,7 @@ Interpretation:
 │   └── train_stage1.py
 └── third_party_overrides/
     ├── LLaVA/
+    │   └── llava/model/language_model/...
     └── LigandMPNN/
 ```
 
@@ -123,6 +125,16 @@ The key modification is that `ProteinMPNN.encode()` can now save per-sample enco
 ```
 
 This is the structure embedding consumed by the downstream alignment model.
+
+### `third_party_overrides/LLaVA/llava/model/language_model/*`
+
+These files are the language-model-side pieces needed by the protein-conditional stack:
+
+- `llava_llama.py`, `llava_mistral.py`, `llava_mpt.py`: the wrapper classes used by `LLaVA`
+- `progen2_hf/*`: local `ProGen2` Hugging Face-style architecture/config/tokenizer files
+- `progen3/*`: local `ProGen3` architecture/config/tokenizer files
+
+They are included so the exported repository contains the backbone-side code that was prepared for later `ProGen2/ProGen3` integration, even though the completed Stage-1 run reported here used the standalone `instructenzyme/modeling.py` path on top of local `ProGen2-base` weights.
 
 ### `instructenzyme/build_index.py`
 
@@ -204,7 +216,7 @@ This repository alone is not enough to run the pipeline. You still need three ex
 
 1. upstream `LLaVA` source tree
 2. upstream `LigandMPNN` source tree
-3. external model weights / datasets
+3. pretrained model weights / datasets
 
 ### Upstream repositories
 
@@ -231,7 +243,9 @@ That workspace is expected to contain:
 
 ### ProGen2-base
 
-Download separately from Hugging Face:
+The exported repository now includes the local `ProGen2/ProGen3` architecture code under `third_party_overrides/LLaVA/llava/model/language_model/`, but you still need to download pretrained weights separately.
+
+Download `ProGen2-base` from Hugging Face:
 
 ```bash
 python -m pip install -U huggingface_hub hf_xet

@@ -15,9 +15,15 @@ Upstream projects referenced by this code:
   - See the upstream repository for license terms.
 
 - `ProGen2`
-  - Backbone weights/code were downloaded separately from Hugging Face and are not redistributed in this export.
+  - Local architecture/config files are included under `third_party_overrides/LLaVA/llava/model/language_model/progen2_hf/`.
+  - Pretrained weights are not redistributed in this export.
   - Model used in the reported runs: `hugohrban/progen2-base`
   - See the model card / repository for its applicable terms.
+
+- `ProGen3`
+  - Local architecture/config files are included under `third_party_overrides/LLaVA/llava/model/language_model/progen3/`.
+  - Pretrained weights are not redistributed in this export.
+  - See the upstream project / model distribution for its applicable terms.
 
 This repository intentionally excludes:
 

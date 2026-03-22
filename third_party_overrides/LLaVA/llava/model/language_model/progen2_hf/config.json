@@ -1,0 +1,45 @@
+{
+  "_name_or_path": "hugohrban/progen2-xlarge",
+  "activation_function": "gelu_new",
+  "architectures": [
+    "ProGenForCausalLM"
+  ],
+  "attn_pdrop": 0.0,
+  "auto_map": {
+    "AutoConfig": "hugohrban/progen2-xlarge--configuration_progen.ProGenConfig",
+    "AutoModelForCausalLM": "hugohrban/progen2-xlarge--modeling_progen.ProGenForCausalLM"
+  },
+  "bos_token_id": 1,
+  "embd_pdrop": 0.0,
+  "embed_dim": 4096,
+  "eos_token_id": 2,
+  "gradient_checkpointing": false,
+  "initializer_range": 0.02,
+  "layer_norm_epsilon": 1e-05,
+  "model_type": "progen",
+  "n_head": 16,
+  "n_inner": null,
+  "n_layer": 32,
+  "n_positions": 1024,
+  "resid_pdrop": 0.0,
+  "rotary_dim": 64,
+  "scale_attn_weights": true,
+  "summary_activation": null,
+  "summary_first_dropout": 0.1,
+  "summary_proj_to_labels": true,
+  "summary_type": "cls_index",
+  "summary_use_proj": true,
+  "task_specific_params": {
+    "text-generation": {
+      "do_sample": true,
+      "max_length": 50,
+      "temperature": 1.0
+    }
+  },
+  "tokenizer_class": "GPT2Tokenizer",
+  "torch_dtype": "float16",
+  "transformers_version": "4.40.0",
+  "use_cache": true,
+  "vocab_size_emb": 32,
+  "vocab_size_lm_head": 32
+}
