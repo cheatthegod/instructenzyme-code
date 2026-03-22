@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Environments
+.venv/
+venv/
+env/
+.conda/
+
+# Editors / OS
+.DS_Store
+.vscode/
+.idea/
+
+# Models / weights / checkpoints
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.ckpt
+model_params/
+progen2-base/
+progen2-xlarge/
+progen3-*/
+
+# Datasets / derived artifacts
+enzyme_data/
+enzyme_pdb/
+enzyme_pdb_*/
+ligandmpnn_emb/
+ligandmpnn_emb_*/
+structure_embeddings/
+
+# Training outputs
+instructenzyme/data/
+instructenzyme/runs/
+instructenzyme/evals/
+instructenzyme/generation_eval/
+logs/
+wandb/
