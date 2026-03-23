@@ -463,6 +463,166 @@ BATCH_SIZE=8 bash instructenzyme/run_generate_eval_4gpu.sh \
 
 This benchmark measures actual free-running generation quality rather than teacher-forcing token prediction.
 
+## How Stage-1 Training Works
+
+This section explains exactly what happens during Stage-1 training — from data loading to the loss function — so there is no ambiguity about what the model is learning.
+
+### Full forward pass
+
+```
+enzyme-substrate complex PDB
+        │
+        ▼ (precomputed, not rerun during training)
+LigandMPNN encoder
+        │
+        ▼
+h_V_last_layer  [B, L, 128]
+ligand-aware residue embeddings, L = number of protein residues
+        │
+        ▼
+FixedQueryCrossAttentionProjector
+  ├─ kv_proj:  Linear(128 → H_lm, bias=False)
+  ├─ kv_norm:  LayerNorm(H_lm)
+  ├─ query:    nn.Parameter [256, H_lm]  (learnable)
+  ├─ query_norm: LayerNorm(H_lm)
+  ├─ 1 × CrossAttentionBlock
+  │    Q = query_norm(query) + 1D-sincos-pos(256)      [B, 256, H_lm]
+  │    K = kv_norm(kv_proj(x)) + 1D-sincos-pos(L)      [B, L,   H_lm]
+  │    V = kv_norm(kv_proj(x))   (no positional bias)  [B, L,   H_lm]
+  │    attn_out = MultiheadAttention(Q, K, V,
+  │                 key_padding_mask=padding_mask)
+  │    query = query + attn_out
+  │    query = query + FFN(LayerNorm(query))
+  └─ post_norm: LayerNorm(H_lm)
+        │
+        ▼
+structure prompt  [B, 256, H_lm]
+variable-length structure compressed into 256 fixed tokens
+        │
+        ▼  prepend
+[ structure_prompt (256) | token_embeds ]   [B, 256+seq_len, H_lm]
+        │
+        ▼
+ProGen2-base  (frozen, H_lm = 1536)
+next-token prediction with cross-entropy loss
+```
+
+Only the projector is trainable. `LigandMPNN` and `ProGen2-base` are fully frozen throughout Stage-1.
+
+### Tokenization
+
+ProGen2 uses a character-level tokenizer. Each standard amino acid is a single token. The format used here is:
+
+```
+input:  "1" + sequence + "2"
+```
+
+where `"1"` is the sequence-start token and `"2"` is the sequence-end / stop token. No HuggingFace `add_special_tokens` wrapping is applied — the `1` and `2` characters in ProGen2's vocabulary serve this role directly.
+
+For a protein of length L, `input_ids` has length `1 + L + 1 = L + 2`.
+
+### What positions are supervised in the loss
+
+After prepending the 256 structure-prompt tokens, the full sequence fed to the backbone is:
+
+```
+position:   0 … 255 | 256 | 257 … 256+L | 257+L
+content:    prompt  | "1" | aa_1 … aa_L | "2"
+label:      IGNORE  |  IGNORE  | supervised | supervised
+```
+
+The loss is computed only over the amino acid positions and the end token — 256 prompt positions and the start token are masked with `IGNORE_INDEX = -100`.
+
+In next-token-prediction terms: at each supervised step k, the model sees
+```
+[structure_prompt | "1" | aa_1 | … | aa_{k-1}]
+```
+and must predict `aa_k`. The final supervised step predicts the end token `"2"`.
+
+### Teacher forcing
+
+Training uses **teacher forcing**: at every step the model receives the ground-truth prefix, regardless of what it would have predicted. This is standard for autoregressive language model training — it keeps gradients stable and avoids compounding errors during training.
+
+The practical consequence is that training loss and teacher-forcing recovery metrics are measured under an optimistic condition (ground-truth context always available), which is why these numbers look better than free-running generation.
+
+### What `val_recovery` actually measures
+
+```python
+# inside evaluate():
+shift_logits = outputs.logits[:, :-1, :]      # [B, T-1, vocab]
+shift_labels = full_labels[:, 1:]              # [B, T-1]
+aa_mask      = valid_mask & isin(shift_labels, amino_acid_token_ids)
+val_recovery = top1_correct[aa_mask] / total[aa_mask]
+```
+
+`val_recovery` is teacher-forcing top-1 accuracy over amino acid positions only. The start token, end token, and all structure-prompt positions are excluded from this metric.
+
+This measures: **given the true sequence up to position k, how often does the model assign the highest probability to the correct next amino acid?**
+
+A random model with no structural conditioning would score ~5% (1/20 amino acids). The trained Stage-1 model reaches ~62%, showing the structure prompt is informative under teacher forcing.
+
+### Loss aggregation across GPUs (DDP)
+
+Each GPU computes the mean cross-entropy loss over its local batch (backbone returns this directly). For logging, the per-GPU mean losses are reduced across ranks and averaged:
+
+```python
+reduced_loss = reduce_scalar(loss.detach() * gradient_accumulation_steps)
+```
+
+For validation, the loss is accumulated as `sum(loss × valid_token_count)` per GPU, then summed globally and divided by the total token count — this gives the correct token-weighted mean across all ranks.
+
+### Optimizer and schedule
+
+| Component | Value |
+|-----------|-------|
+| Optimizer | AdamW |
+| Learning rate | 2e-4 |
+| Weight decay | 0.01 |
+| Gradient clipping | max norm 1.0 |
+| LR schedule | linear warmup → linear decay |
+| Warmup steps | 100 (Python default, not set in shell script) |
+| dtype | bfloat16 (mixed precision) |
+
+Only projector parameters are passed to the optimizer. Backbone parameters are excluded entirely.
+
+### Key architecture hyperparameters
+
+| Parameter | Default | Meaning |
+|-----------|---------|---------|
+| `structure_hidden_size` | 128 | LigandMPNN output dimension |
+| `num_queries` | 256 | Fixed output length of projector |
+| `num_heads` | 8 | Attention heads in cross-attention |
+| `num_layers` | 1 | Stacked cross-attention blocks |
+| `pos_encoding` | `1d` | Sinusoidal 1D positional encoding for both query and key positions |
+| `use_query_pos` | True | Add positional encoding to learnable queries |
+| `use_input_pos` | True | Add positional encoding to input residue embeddings |
+| `use_post_proj` | False | No extra linear after resampler (Identity) |
+
+### What the projector is learning
+
+The 256 learnable query vectors act as fixed "slots" that attend over the variable-length residue embeddings. After training, each query should capture some aspect of the structural context that is predictive of the sequence. The cross-attention mechanism allows every query to attend to all residues, with the padding mask ensuring padded positions (from batching) are ignored.
+
+The positional encodings on queries and input residues allow the model to distinguish position along the query and along the sequence, though in Stage-1 there is no explicit residue-order correspondence enforced between queries and amino acid positions — the queries are free to attend globally.
+
+### Generation: how it differs from training
+
+During generation, teacher forcing is off. The model runs fully autoregressively:
+
+```
+input:  [structure_prompt (256) | "1"]
+step 0: predict aa_1
+step 1: predict aa_2 given aa_1
+...
+step k: predict aa_{k+1} given aa_1 … aa_k
+stop:   when "2" is predicted OR per-sample length limit is reached
+```
+
+At each step, logits are **restricted to the 20 amino acid tokens + stop token** before sampling or greedy decoding. All other vocabulary entries are masked to -1e9.
+
+KV caching is enabled during generation for efficiency. For batched generation, finished sequences continue to receive the stop token as input to maintain batch alignment.
+
+---
+
 ## Why The Generation Metrics Are Much Lower Than Recovery Under Teacher Forcing
 
 This is expected.

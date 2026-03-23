@@ -230,6 +230,160 @@ bash get_model_params.sh ./model_params
 
 完整命令请直接看英文 README，对应步骤已经全部列出。
 
+## Stage-1 训练原理
+
+本节详细说明 Stage-1 训练期间到底发生了什么——从数据读取到 loss 计算——消除所有歧义。
+
+### 完整前向传播
+
+```
+enzyme-substrate complex PDB
+        │
+        ▼（预先计算，训练时不重新运行）
+LigandMPNN encoder
+        │
+        ▼
+h_V_last_layer  [B, L, 128]
+配体感知的残基 embedding，L = 蛋白质残基数
+        │
+        ▼
+FixedQueryCrossAttentionProjector
+  ├─ kv_proj:    Linear(128 → H_lm, bias=False)
+  ├─ kv_norm:    LayerNorm(H_lm)
+  ├─ query:      nn.Parameter [256, H_lm]（可学习）
+  ├─ query_norm: LayerNorm(H_lm)
+  ├─ 1 层 CrossAttentionBlock
+  │    Q = query_norm(query) + 1D-sincos-pos(256)      [B, 256, H_lm]
+  │    K = kv_norm(kv_proj(x)) + 1D-sincos-pos(L)      [B, L,   H_lm]
+  │    V = kv_norm(kv_proj(x))   （V 不加位置编码）   [B, L,   H_lm]
+  │    attn_out = MultiheadAttention(Q, K, V,
+  │                 key_padding_mask=padding_mask)
+  │    query = query + attn_out
+  │    query = query + FFN(LayerNorm(query))
+  └─ post_norm: LayerNorm(H_lm)
+        │
+        ▼
+结构 prompt  [B, 256, H_lm]
+变长的结构信息被压缩成 256 个固定 token
+        │
+        ▼  拼接到前面
+[ structure_prompt (256) | token_embeds ]   [B, 256+seq_len, H_lm]
+        │
+        ▼
+ProGen2-base（冻结，H_lm = 1536）
+next-token prediction，cross-entropy loss
+```
+
+**只有 projector 参与训练**。`LigandMPNN` 和 `ProGen2-base` 在整个 Stage-1 期间完全冻结。
+
+### tokenization 格式
+
+ProGen2 使用字符级 tokenizer，每个标准氨基酸是一个 token。这里使用的格式是：
+
+```
+"1" + sequence + "2"
+```
+
+其中 `"1"` 是序列开始 token，`"2"` 是序列结束/终止 token。不使用 HuggingFace 的 `add_special_tokens` 包装，ProGen2 词表中的字符 `1` 和 `2` 直接承担这个角色。
+
+对于长度为 L 的蛋白质，`input_ids` 长度为 `1 + L + 1 = L + 2`。
+
+### 哪些位置参与 loss 计算
+
+把 256 个结构 prompt token 拼到前面后，送入 backbone 的完整序列是：
+
+```
+位置：   0 … 255 | 256  | 257 … 256+L | 257+L
+内容：   prompt  | "1"  | aa_1 … aa_L |  "2"
+label：  IGNORE  | IGNORE |  参与 loss  | 参与 loss
+```
+
+**loss 只计算在氨基酸位置和终止 token 上**——256 个 prompt 位置和 start token 全部用 `IGNORE_INDEX = -100` 屏蔽。
+
+用 next-token-prediction 的语言来说：在第 k 步，模型看到
+```
+[结构 prompt | "1" | aa_1 | … | aa_{k-1}]
+```
+并预测 `aa_k`。最后一个被监督的步骤是预测 end token `"2"`。
+
+### Teacher forcing
+
+训练使用 **teacher forcing**：每一步都把 ground-truth 前缀喂给模型，无论模型本来会预测什么。这是自回归语言模型训练的标准做法——可以保持梯度稳定，避免训练期间的误差累积。
+
+实际后果是：训练 loss 和 teacher-forcing recovery 指标是在乐观条件下（上下文始终是真实序列）测量的，因此这些数字看起来比 free-running generation 好很多。
+
+### `val_recovery` 的真实含义
+
+```python
+# 在 evaluate() 内部：
+shift_logits = outputs.logits[:, :-1, :]       # [B, T-1, vocab]
+shift_labels = full_labels[:, 1:]               # [B, T-1]
+aa_mask      = valid_mask & isin(shift_labels, amino_acid_token_ids)
+val_recovery = top1_correct[aa_mask] / total[aa_mask]
+```
+
+`val_recovery` 是 teacher-forcing top-1 准确率，**只统计氨基酸位置**。start token、end token 和所有结构 prompt 位置都不计入。
+
+这个指标衡量的是：**在给定真实序列前缀的条件下，模型对下一个氨基酸预测正确的比例**。
+
+没有结构条件的随机模型期望得分约 5%（20 种氨基酸中猜对 1 个）。训练后的 Stage-1 模型达到约 62%，说明结构 prompt 在 teacher forcing 条件下确实提供了有效信息。
+
+### DDP 多卡下的 loss 聚合
+
+每张 GPU 计算本地 batch 的平均 cross-entropy loss（backbone 直接返回）。日志记录时对各 rank 的局部均值做 AllReduce 再取平均。
+
+验证时的聚合方式更精确：每 GPU 累积 `sum(loss × valid_token_count)`，然后全局求和再除以总 token 数，得到正确的 token 加权均值。
+
+### 优化器与学习率调度
+
+| 项目 | 值 |
+|------|----|
+| 优化器 | AdamW |
+| 学习率 | 2e-4 |
+| 权重衰减 | 0.01 |
+| 梯度裁剪 | max norm 1.0 |
+| 学习率调度 | 线性 warmup → 线性衰减 |
+| warmup 步数 | 100（Python 默认值，shell 脚本未显式传入） |
+| 精度 | bfloat16 混合精度 |
+
+**只有 projector 的参数传入优化器**，backbone 参数完全不参与。
+
+### 关键架构超参
+
+| 参数 | 默认值 | 含义 |
+|------|--------|------|
+| `structure_hidden_size` | 128 | LigandMPNN 输出维度 |
+| `num_queries` | 256 | projector 固定输出 token 数 |
+| `num_heads` | 8 | cross-attention 的注意力头数 |
+| `num_layers` | 1 | 堆叠的 cross-attention block 层数 |
+| `pos_encoding` | `1d` | query 和 key 均使用 1D sinusoidal 位置编码 |
+| `use_query_pos` | True | query 加位置编码 |
+| `use_input_pos` | True | 输入残基 embedding 加位置编码 |
+| `use_post_proj` | False | resampler 后不加额外线性层（Identity） |
+
+### projector 在学什么
+
+256 个可学习 query 向量充当固定的"槽位"，对变长残基 embedding 做 cross-attention。训练结束后，每个 query 应当捕捉到对序列预测有用的结构上下文的某个方面。cross-attention 允许每个 query 关注所有残基，padding mask 确保 batch 对齐时的填充位置不被关注。
+
+query 和输入残基上都有位置编码，让模型能区分 query 编号和残基序号，但 Stage-1 中并没有强制 query 和氨基酸位置之间有一对一对应关系——query 可以自由地全局 attend。
+
+### 生成时与训练的区别
+
+生成时 teacher forcing 关闭，模型完全自回归运行：
+
+```
+输入：  [结构 prompt (256) | "1"]
+第 0 步：预测 aa_1
+第 1 步：在已有 aa_1 的条件下预测 aa_2
+…
+第 k 步：在已有 aa_1 … aa_k 的条件下预测 aa_{k+1}
+终止：  当预测到 "2" 或达到单样本长度上限时停止
+```
+
+每步 logit 在采样或 greedy 解码前会被**限制在 20 种氨基酸 token + 终止 token 上**，其余词表位置全部设为 -1e9。
+
+生成时开启 KV cache 提高效率。批量生成时，已完成的序列继续接收终止 token 作为输入，以维持 batch 对齐。
+
 ## 这份仓库不包含什么
 
 为了保证能安全放到 GitHub，这份导出版明确不包含：
