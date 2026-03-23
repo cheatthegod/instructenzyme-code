@@ -1,6 +1,178 @@
-# InstructEnzyme Code-Only Export
+# InstructEnzyme
 
 Chinese version: [README_zh.md](README_zh.md)
+
+---
+
+## Background: What Problem Are We Solving
+
+**Enzymes are proteins.** Which chemical reactions they catalyze, and which substrates they recognize, are determined by their amino acid sequence — the sequence folds into a three-dimensional structure, and the geometry of the active site and substrate together determine catalytic activity.
+
+**Enzyme design** asks: given a target reaction and its substrate molecule, can we design a new amino acid sequence that, when folded, would catalyze that reaction effectively?
+
+Traditional approaches (e.g. Rosetta) rely on hand-crafted physical rules and are slow and brittle. Deep learning approaches aim to let a model learn the relationship between sequence and structure from existing enzyme-substrate complexes, then use that knowledge to generate new sequences.
+
+**InstructEnzyme's core idea:**
+
+> Treat the 3D structure of an enzyme-substrate complex as a conditioning signal, and use a protein language model to generate amino acid sequences given that structural context.
+
+---
+
+## The Three Components
+
+The system combines three existing tools:
+
+### LigandMPNN — structure encoder
+
+LigandMPNN is a graph neural network designed for protein-ligand complexes. Given a PDB file of an enzyme-substrate complex, it produces one 128-dimensional embedding vector for each amino acid residue.
+
+These embeddings are **ligand-aware**: they encode not just the protein backbone but also the nearby ligand (substrate/small-molecule) geometry. A residue sitting in the active site next to the substrate will have a very different embedding from a buried residue far from any ligand.
+
+For a protein with L residues, LigandMPNN outputs a `[L, 128]` matrix.
+
+### ProGen2 — protein language model
+
+ProGen2 is a language model pre-trained on millions of protein sequences, structured similarly to GPT. It "knows" what valid protein sequences look like — given a partial sequence, it can predict what amino acids are likely to follow.
+
+ProGen2-base has a hidden dimension of 1536 (each token is represented as a 1536-dimensional vector).
+
+### Projector — the bridge between them
+
+LigandMPNN produces 128-dimensional structural vectors. ProGen2 expects 1536-dimensional token embeddings. And different proteins have different residue counts L — but the language model needs a fixed-size input prefix.
+
+The projector's job:
+
+> Compress the variable-length structural description `[L, 128]` into a fixed-length "structure prompt" `[256, 1536]`, formatted identically to ProGen2's token embeddings.
+
+Internally it uses **cross-attention**: 256 learnable "query" vectors attend over all L residues to extract the most useful structural information, producing a fixed 256-vector output.
+
+This design mirrors the multimodal alignment in LLaVA — LLaVA aligns image features to a language model's input space; here we align structural features to a protein language model's input space.
+
+---
+
+## How the System Works End-to-End
+
+```
+Enzyme-substrate complex (PDB file)
+        │
+        ▼  LigandMPNN encodes the structure
+Per-residue structural embeddings  [L, 128]
+(each vector encodes local geometry + ligand context)
+        │
+        ▼  Projector compresses to fixed length
+Structure prompt  [256, 1536]
+(256 vectors, same format as ProGen2 token embeddings)
+        │
+        ▼  Prepend to sequence tokens
+[structure_prompt (256 tokens) | amino acid sequence tokens]
+        │
+        ▼  ProGen2 predicts next token at each position
+Next-amino-acid predictions, cross-entropy loss
+```
+
+The training objective: make the projector learn to translate structural information into a prompt that causes ProGen2 to predict the correct amino acid sequence.
+
+---
+
+## What Goes In And What Comes Out At Each Step
+
+The easiest way to get lost in this project is to mix up:
+
+- file-level inputs and outputs
+- tensor-level inputs and outputs
+- offline preprocessing versus train-time computation
+
+So here is the pipeline in a more explicit contract form.
+
+### File-level inputs and outputs
+
+| Step | Input | Processing | Output |
+|------|-------|------------|--------|
+| 1. `mmCIF -> PDB` | `enzyme_data/*.cif` | convert complex structures to fixed-column `PDB` | `enzyme_pdb/*.pdb` |
+| 2. `PDB -> LigandMPNN embedding` | `enzyme_pdb/*.pdb` | run LigandMPNN encoder once offline | `ligandmpnn_emb/*.pt` |
+| 3. `build_index` | `*.pdb` + `*.pt` | pair sequences with embeddings and split train/val/test | `train.jsonl`, `val.jsonl`, `test.jsonl` |
+| 4. `dataset + collator` | JSONL records | load sequence + embedding and pad into a batch | batched tensors |
+| 5. `Stage-1 model` | batched tensors | `Projector -> ProGen2` | `loss`, `logits`, recovery metrics |
+
+### What each file actually contains
+
+**1. `enzyme_data/*.cif`**
+
+A raw enzyme-substrate complex structure, typically from an external structural dataset.
+
+**2. `enzyme_pdb/*.pdb`**
+
+The same complex rewritten in a `LigandMPNN`-friendly fixed-column `PDB` format. This is still geometry, not learned features.
+
+**3. `ligandmpnn_emb/*.pt`**
+
+One `.pt` file per complex, in the minimal format:
+
+```python
+{"h_V_last_layer": tensor}
+```
+
+where:
+
+- `h_V_last_layer.shape = [L, 128]`
+- `L` is the residue count of the design chain
+- `128` is the LigandMPNN encoder output width
+
+After this step, `LigandMPNN` is no longer part of the Stage-1 training graph. Training reads this tensor directly from disk.
+
+**4. `train.jsonl / val.jsonl / test.jsonl`**
+
+Each line is a sample record such as:
+
+```json
+{
+  "id": "6abc_A",
+  "split": "train",
+  "chain_id": "A",
+  "sequence": "MKVLINGE...",
+  "seq_len": 312,
+  "embedding_dim": 128,
+  "pdb_path": "/path/to/enzyme_pdb/6abc_A.pdb",
+  "embedding_path": "/path/to/ligandmpnn_emb/6abc_A.pt"
+}
+```
+
+This manifest fixes the pair that matters for training:
+
+- which target sequence should be predicted
+- which structure embedding should condition that prediction
+
+### One concrete sample through the pipeline
+
+Suppose we have:
+
+- `id = 6abc_A`
+- sequence length `L = 312`
+
+Then the representations are:
+
+1. raw structure file:
+   - `enzyme_data/6abc_A.cif`
+2. converted structure file:
+   - `enzyme_pdb/6abc_A.pdb`
+3. structure embedding:
+   - `ligandmpnn_emb/6abc_A.pt`
+   - with `h_V_last_layer.shape = [312, 128]`
+4. tokenized sequence:
+   - raw sequence length = `312`
+   - after adding start `"1"` and end `"2"`, `input_ids.shape = [314]`
+5. projector output:
+   - `structure_prompt.shape = [256, 1536]`
+6. final LM input length:
+   - `256 + 314 = 570`
+
+This is the key idea:
+
+- the structure side is variable-length at the residue level
+- the projector compresses it to a fixed prompt length of `256`
+- the backbone consumes `[256 structure tokens] + [L+2 sequence tokens]`
+
+---
 
 ## What This Repository Is
 
@@ -26,6 +198,8 @@ This export intentionally **does not include**:
 - precomputed embeddings
 - training checkpoints
 - evaluation outputs
+
+---
 
 ## Current Status
 
@@ -90,14 +264,16 @@ Interpretation:
 
 A longer projector-only continuation run was launched from the previous best checkpoint, still without Stage-2 LoRA.
 
-Current best checkpoint from that run (`step 1000` as of 2026-03-22):
+That continuation run finished normally. The run ended at `step 1846`, and the current best checkpoint was reached at `step 1500`:
 
-- `val_loss = 1.1851611747426283`
-- `val_ppl = 3.2712140160567045`
-- `val_recovery = 0.6351145485439738`
-- `val_top5_recovery = 0.8728833421222242`
+- `val_loss = 1.1598191470202586`
+- `val_ppl = 3.189356419342728`
+- `val_recovery = 0.6433565750668933`
+- `val_top5_recovery = 0.8770580652721627`
 
 This is already better than the original full-validation result from the 1k-step run.
+
+---
 
 ## Repository Layout
 
@@ -125,6 +301,8 @@ This is already better than the original full-validation result from the 1k-step
     │   └── llava/model/language_model/...
     └── LigandMPNN/
 ```
+
+---
 
 ## What Each Part Does
 
@@ -199,7 +377,7 @@ Training policy:
 
 Runs Stage-1 adapter-only training.
 
-This script now logs:
+This script logs:
 
 - `val_loss`
 - `val_ppl`
@@ -207,6 +385,8 @@ This script now logs:
 - `val_top5_recovery`
 
 Recovery is defined over amino-acid positions only; control tokens like `1` and `2` are excluded.
+
+Supports `--projector_init_ckpt` to resume from an existing projector checkpoint rather than starting from scratch.
 
 ### `instructenzyme/eval_stage1.py`
 
@@ -222,6 +402,11 @@ Runs true conditioned generation:
 
 The current version supports **batched generation**, which materially improves GPU utilization.
 
+Two fixes applied versus the original version:
+
+- `seq_len` sort key now falls back to `len(record["sequence"])` if the field is missing
+- stopping is now controlled per-sample rather than using the longest sequence in the batch as a uniform ceiling
+
 ### `instructenzyme/aggregate_generation_eval.py`
 
 Merges shard-wise generation outputs and computes summary statistics like:
@@ -231,6 +416,8 @@ Merges shard-wise generation outputs and computes summary statistics like:
 - exact-match rate
 - stop rate
 - length ratio
+
+---
 
 ## External Dependencies You Still Need
 
@@ -294,6 +481,8 @@ You must provide your own complex dataset, for example:
 
 This export does not include any structural dataset.
 
+---
+
 ## Recommended Environment
 
 A tested environment was created with:
@@ -331,6 +520,8 @@ python -m pip install \
   ninja \
   wandb
 ```
+
+---
 
 ## End-to-End Pipeline
 
@@ -377,7 +568,7 @@ BATCH_SIZE=8 bash run_extract_ligandmpnn_embeddings_4gpu.sh \
 Output per sample:
 
 ```python
-{"h_V_last_layer": tensor}
+{"h_V_last_layer": tensor}  # shape: [L, 128]
 ```
 
 ### Step 3: Build manifest
@@ -395,6 +586,12 @@ In the completed run, this produced:
 - train: `59067`
 - val: `600`
 - test: `584`
+
+Critical contract:
+
+- `len(sequence)` must equal `h_V_last_layer.shape[0]`
+
+The implementation assumes residue `i` in the sequence and residue embedding `i` in the structure tensor refer to the same design position. If that alignment is broken, the supervision signal is misaligned.
 
 ### Step 4: Export WDS (optional)
 
@@ -423,7 +620,35 @@ bash instructenzyme/run_stage1_base_4gpu.sh \
   /path/to/instructenzyme/runs/progen2-base-stage1-1k
 ```
 
-This is the exact type of run that produced the reported Stage-1 checkpoint.
+The step-level IO can be summarized as:
+
+```text
+input:
+  (sequence, embedding_path) from train.jsonl
+
+inside the model:
+  embedding_path -> h_V_last_layer [L,128]
+  sequence       -> input_ids [L+2]
+  Projector      -> structure_prompt [256,1536]
+  ProGen2        -> logits [256+L+2, vocab]
+
+output:
+  scalar loss
+  validation metrics: val_loss / val_ppl / val_recovery / val_top5_recovery
+```
+
+To continue from a previous checkpoint:
+
+```bash
+MAX_TRAIN_STEPS=6000 \
+BATCH_SIZE=8 \
+PROJECTOR_INIT_CKPT=/path/to/previous_run/best/projector.pt \
+bash instructenzyme/run_stage1_base_4gpu.sh \
+  /path/to/progen2-base \
+  /path/to/instructenzyme/data/index/train.jsonl \
+  /path/to/instructenzyme/data/index/val.jsonl \
+  /path/to/instructenzyme/runs/progen2-base-stage1-continue
+```
 
 ### Step 6: Full validation / full test evaluation
 
@@ -463,9 +688,98 @@ BATCH_SIZE=8 bash instructenzyme/run_generate_eval_4gpu.sh \
 
 This benchmark measures actual free-running generation quality rather than teacher-forcing token prediction.
 
+The key difference from training is:
+
+- training: every step gets the ground-truth prefix
+- generation: only `structure_prompt + "1"` is given, then the model must continue on its own
+
+So generation is not asking "can the model classify the next token under perfect context?" It is asking "can the model write an entire protein sequence under structural conditioning?"
+
+---
+
 ## How Stage-1 Training Works
 
 This section explains exactly what happens during Stage-1 training — from data loading to the loss function — so there is no ambiguity about what the model is learning.
+
+### What is frozen and what is trained
+
+```
+LigandMPNN    ──── FROZEN  (run once offline, outputs saved as .pt files)
+Projector     ──── TRAINABLE  ← the only thing updated in Stage-1
+ProGen2-base  ──── FROZEN  (pre-trained weights unchanged)
+```
+
+Why freeze everything except the projector in Stage-1? LigandMPNN is already an effective structure encoder. ProGen2 already has strong protein sequence knowledge from pre-training. The specific thing we need to learn is how to translate structural embeddings into a format ProGen2 can understand — that is exactly what the projector does. Training only the projector first makes it easy to diagnose what is working.
+
+### The single most important thing to remember
+
+**Training does not feed raw PDB files into the model.**
+
+Stage-1 actually trains on just two things:
+
+- a sequence string
+- a precomputed structure tensor `h_V_last_layer`
+
+So the train-time graph is:
+
+```text
+h_V_last_layer -> Projector -> ProGen2
+```
+
+not:
+
+```text
+PDB -> LigandMPNN -> Projector -> ProGen2
+```
+
+`LigandMPNN` is an **offline preprocessor** in Stage-1, not a train-time module.
+
+### What one batch looks like before it enters the model
+
+Suppose a batch contains two samples:
+
+- sample A: sequence length `312`
+- sample B: sequence length `280`
+
+The dataset / collator first constructs the structure side:
+
+```text
+A: h_V_last_layer [312, 128]
+B: h_V_last_layer [280, 128]
+```
+
+After padding:
+
+```text
+structure_embs           [2, 312, 128]
+structure_attention_mask [2, 312]
+```
+
+For the sequence side, the token lengths are:
+
+- A: `312 + 2 = 314`
+- B: `280 + 2 = 282`
+
+After padding:
+
+```text
+input_ids       [2, 314]
+attention_mask  [2, 314]
+labels          [2, 314]
+```
+
+Inside the model, the `256` structure prompt tokens are prepended, so the actual backbone input becomes:
+
+```text
+inputs_embeds   [2, 256 + 314, 1536] = [2, 570, 1536]
+full_labels     [2, 570]
+```
+
+This distinction matters:
+
+- the dataset emits text-only labels
+- the model prepends `256` `IGNORE_INDEX` positions internally
+- only then do labels match the backbone input length
 
 ### Full forward pass
 
@@ -481,9 +795,9 @@ ligand-aware residue embeddings, L = number of protein residues
         │
         ▼
 FixedQueryCrossAttentionProjector
-  ├─ kv_proj:  Linear(128 → H_lm, bias=False)
-  ├─ kv_norm:  LayerNorm(H_lm)
-  ├─ query:    nn.Parameter [256, H_lm]  (learnable)
+  ├─ kv_proj:    Linear(128 → H_lm, bias=False)
+  ├─ kv_norm:    LayerNorm(H_lm)
+  ├─ query:      nn.Parameter [256, H_lm]  (learnable)
   ├─ query_norm: LayerNorm(H_lm)
   ├─ 1 × CrossAttentionBlock
   │    Q = query_norm(query) + 1D-sincos-pos(256)      [B, 256, H_lm]
@@ -507,8 +821,6 @@ ProGen2-base  (frozen, H_lm = 1536)
 next-token prediction with cross-entropy loss
 ```
 
-Only the projector is trainable. `LigandMPNN` and `ProGen2-base` are fully frozen throughout Stage-1.
-
 ### Tokenization
 
 ProGen2 uses a character-level tokenizer. Each standard amino acid is a single token. The format used here is:
@@ -521,14 +833,25 @@ where `"1"` is the sequence-start token and `"2"` is the sequence-end / stop tok
 
 For a protein of length L, `input_ids` has length `1 + L + 1 = L + 2`.
 
+At this step, the input/output contract is:
+
+```text
+input:
+  sequence string length L
+
+output:
+  input_ids [L+2]
+  labels    [L+2]
+```
+
 ### What positions are supervised in the loss
 
 After prepending the 256 structure-prompt tokens, the full sequence fed to the backbone is:
 
 ```
-position:   0 … 255 | 256 | 257 … 256+L | 257+L
-content:    prompt  | "1" | aa_1 … aa_L | "2"
-label:      IGNORE  |  IGNORE  | supervised | supervised
+position:   0 … 255 | 256  | 257 … 256+L | 257+L
+content:    prompt  | "1"  | aa_1 … aa_L |  "2"
+label:      IGNORE  | IGNORE | supervised | supervised
 ```
 
 The loss is computed only over the amino acid positions and the end token — 256 prompt positions and the start token are masked with `IGNORE_INDEX = -100`.
@@ -539,11 +862,56 @@ In next-token-prediction terms: at each supervised step k, the model sees
 ```
 and must predict `aa_k`. The final supervised step predicts the end token `"2"`.
 
+At this step, the model-side tensors are:
+
+```text
+input:
+  structure_prompt [B, 256, 1536]
+  token_embeds     [B, T,   1536]
+
+output:
+  inputs_embeds    [B, 256+T, 1536]
+  full_labels      [B, 256+T]
+```
+
 ### Teacher forcing
 
 Training uses **teacher forcing**: at every step the model receives the ground-truth prefix, regardless of what it would have predicted. This is standard for autoregressive language model training — it keeps gradients stable and avoids compounding errors during training.
 
-The practical consequence is that training loss and teacher-forcing recovery metrics are measured under an optimistic condition (ground-truth context always available), which is why these numbers look better than free-running generation.
+**Analogy**: it is like practicing a translation with a language teacher who always shows you the correct previous words. You learn the patterns quickly, but you never practice recovering from your own mistakes.
+
+The practical consequence: training loss and teacher-forcing recovery metrics are measured under an optimistic condition (ground-truth context always available), which is why these numbers look better than free-running generation.
+
+### Where gradients actually flow
+
+This is another common source of confusion.
+
+The backward graph is:
+
+```text
+loss
+  ↑
+logits
+  ↑
+ProGen2-base (frozen, parameters not updated)
+  ↑
+structure_prompt
+  ↑
+Projector (trainable, parameters updated)
+  ↑
+h_V_last_layer (loaded tensor, not updated)
+```
+
+So in Stage-1:
+
+- the projector is inside the graph and trainable
+- ProGen2 is inside the graph but frozen
+- `h_V_last_layer` is just an input tensor from disk
+- LigandMPNN is not in the train-time graph at all
+
+In one sentence:
+
+> Stage-1 does not teach LigandMPNN how to encode structure, and it does not retrain ProGen2. It only teaches a translator in the middle: the projector.
 
 ### What `val_recovery` actually measures
 
@@ -563,11 +931,7 @@ A random model with no structural conditioning would score ~5% (1/20 amino acids
 
 ### Loss aggregation across GPUs (DDP)
 
-Each GPU computes the mean cross-entropy loss over its local batch (backbone returns this directly). For logging, the per-GPU mean losses are reduced across ranks and averaged:
-
-```python
-reduced_loss = reduce_scalar(loss.detach() * gradient_accumulation_steps)
-```
+Each GPU computes the mean cross-entropy loss over its local batch (backbone returns this directly). For logging, the per-GPU mean losses are reduced across ranks and averaged.
 
 For validation, the loss is accumulated as `sum(loss × valid_token_count)` per GPU, then summed globally and divided by the total token count — this gives the correct token-weighted mean across all ranks.
 
@@ -623,6 +987,19 @@ KV caching is enabled during generation for efficiency. For batched generation, 
 
 ---
 
+## Stage-1 vs Stage-2
+
+| | Stage-1 (completed) | Stage-2 (planned) |
+|--|--|--|
+| What is trained | Projector only | Projector + top layers of ProGen2 (LoRA) |
+| ProGen2 state | Fully frozen | Top layers lightly updated |
+| Goal | Teach the projector to translate structural embeddings | Teach ProGen2 to use structural prompts during generation |
+| Analogy | Learn to describe a French text in English | Learn to write well given an English description |
+
+Stage-2 starts from the Stage-1 projector checkpoint and adds LoRA adapters to the top Transformer blocks of ProGen2-base. The expected effect: free-running generation recovery improves significantly because ProGen2 now receives gradient signal from the structural conditioning task.
+
+---
+
 ## Why The Generation Metrics Are Much Lower Than Recovery Under Teacher Forcing
 
 This is expected.
@@ -642,6 +1019,8 @@ For the current project state, the answer is:
 
 That is exactly why the natural next step is **Stage-2**.
 
+---
+
 ## Recommended Next Step
 
 If you continue this project, the next technically justified step is:
@@ -655,6 +1034,8 @@ In other words:
 
 - Stage-1 aligns the structure prompt
 - Stage-2 teaches the language model to actually use it well during generation
+
+---
 
 ## Notes
 
